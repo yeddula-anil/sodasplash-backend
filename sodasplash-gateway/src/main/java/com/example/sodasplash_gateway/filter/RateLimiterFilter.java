@@ -8,6 +8,9 @@ import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebFilter;
 import org.springframework.web.server.WebFilterChain;
@@ -15,28 +18,63 @@ import reactor.core.publisher.Mono;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.List;
 
 @Slf4j
 @Component
 public class RateLimiterFilter implements WebFilter, Ordered {
 
+    private static final RedisScript<List> TOKEN_BUCKET_SCRIPT = new DefaultRedisScript<>("""
+            local key = KEYS[1]
+            local capacity = tonumber(ARGV[1])
+            local refillRate = tonumber(ARGV[2])
+            local now = tonumber(ARGV[3])
+            local ttl = tonumber(ARGV[4])
+            local state = redis.call('HMGET', key, 'tokens', 'timestamp')
+            local tokens = tonumber(state[1])
+            local lastRefill = tonumber(state[2])
+            if tokens == nil or lastRefill == nil then
+                tokens = capacity
+                lastRefill = now
+            else
+                local elapsedSeconds = math.max(0, now - lastRefill) / 1000
+                tokens = math.min(capacity, tokens + elapsedSeconds * refillRate)
+                lastRefill = now
+            end
+            local allowed = 0
+            local requestedTokens = tonumber(ARGV[5])
+            if tokens >= requestedTokens then
+                tokens = tokens - requestedTokens
+                allowed = 1
+            end
+            redis.call('HSET', key, 'tokens', tokens, 'timestamp', lastRefill)
+            redis.call('EXPIRE', key, ttl)
+            return {allowed, math.floor(tokens)}
+            """, List.class);
+
     private final UserKeyResolver userKeyResolver;
     private final int replenishRate;
     private final int burstCapacity;
-
-    // In-memory token bucket per key
-    private final Map<String, TokenBucket> buckets = new ConcurrentHashMap<>();
+    private final int requestedTokens;
+    private final int bucketTtlSeconds;
+    private final ReactiveStringRedisTemplate redisTemplate;
 
     public RateLimiterFilter(
             UserKeyResolver userKeyResolver,
             @Value("${gateway.rate-limit.replenish-rate:100}") int replenishRate,
-            @Value("${gateway.rate-limit.burst-capacity:100}") int burstCapacity
+            @Value("${gateway.rate-limit.burst-capacity:100}") int burstCapacity,
+            @Value("${gateway.rate-limit.requested-tokens:1}") int requestedTokens,
+            ReactiveStringRedisTemplate redisTemplate
     ) {
         this.userKeyResolver = userKeyResolver;
+        if (replenishRate <= 0 || burstCapacity <= 0 || requestedTokens <= 0) {
+            throw new IllegalArgumentException("Rate-limit settings must be positive");
+        }
         this.replenishRate = replenishRate;
         this.burstCapacity = burstCapacity;
+        this.requestedTokens = requestedTokens;
+        this.bucketTtlSeconds = Math.max(60, (int) Math.ceil((double) burstCapacity / replenishRate * 2));
+        this.redisTemplate = redisTemplate;
     }
 
     @Override
@@ -49,17 +87,36 @@ public class RateLimiterFilter implements WebFilter, Ordered {
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
         return userKeyResolver.resolve(exchange)
                 .defaultIfEmpty("ip:anonymous")
-                .flatMap(key -> {
-                    TokenBucket bucket = buckets.computeIfAbsent(key, k -> new TokenBucket(burstCapacity, replenishRate));
-
-                    if (bucket.tryConsume()) {
+                .flatMap(key -> consumeToken(key)
+                        .flatMap(result -> {
+                    if (result.allowed()) {
                         exchange.getResponse().getHeaders().add("X-RateLimit-Limit", String.valueOf(burstCapacity));
-                        exchange.getResponse().getHeaders().add("X-RateLimit-Remaining", String.valueOf(bucket.getTokens()));
+                        exchange.getResponse().getHeaders().add("X-RateLimit-Remaining", String.valueOf(result.remainingTokens()));
                         return chain.filter(exchange);
-                    } else {
+                    }
                         log.warn("Rate limit exceeded for key: {}", key);
                         return rateLimitExceeded(exchange);
+                })
+                .onErrorResume(error -> {
+                    log.error("Upstash rate-limit request failed", error);
+                    return rateLimitServiceUnavailable(exchange);
+                }));
+    }
+
+    private Mono<RateLimitResult> consumeToken(String key) {
+        return redisTemplate.execute(
+                        TOKEN_BUCKET_SCRIPT,
+                        List.of("rate-limit:" + key),
+                        List.of(
+                burstCapacity, replenishRate / 60.0, System.currentTimeMillis(), bucketTtlSeconds, requestedTokens
+                        )
+                )
+                .single()
+                .map(result -> {
+                    if (result.size() != 2 || !(result.get(0) instanceof Number) || !(result.get(1) instanceof Number)) {
+                        throw new IllegalStateException("Unexpected response from Upstash rate limiter");
                     }
+                    return new RateLimitResult(((Number) result.get(0)).intValue() == 1, ((Number) result.get(1)).intValue());
                 });
     }
 
@@ -80,40 +137,15 @@ public class RateLimiterFilter implements WebFilter, Ordered {
         return exchange.getResponse().writeWith(Mono.just(buffer));
     }
 
-    private static class TokenBucket {
-        private final int capacity;
-        private final double refillRatePerSecond;
-        private double tokens;
-        private long lastRefillTimestamp;
-
-        public TokenBucket(int capacity, int refillRatePerMinute) {
-            this.capacity = capacity;
-            this.tokens = capacity;
-            this.refillRatePerSecond = refillRatePerMinute / 60.0;
-            this.lastRefillTimestamp = System.currentTimeMillis();
-        }
-
-        public synchronized boolean tryConsume() {
-            refill();
-            if (tokens >= 1.0) {
-                tokens -= 1.0;
-                return true;
-            }
-            return false;
-        }
-
-        public synchronized int getTokens() {
-            refill();
-            return (int) Math.floor(tokens);
-        }
-
-        private void refill() {
-            long now = System.currentTimeMillis();
-            double deltaSeconds = (now - lastRefillTimestamp) / 1000.0;
-            if (deltaSeconds > 0) {
-                tokens = Math.min(capacity, tokens + deltaSeconds * refillRatePerSecond);
-                lastRefillTimestamp = now;
-            }
-        }
+    private Mono<Void> rateLimitServiceUnavailable(ServerWebExchange exchange) {
+        exchange.getResponse().setStatusCode(HttpStatus.SERVICE_UNAVAILABLE);
+        exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+        exchange.getResponse().getHeaders().add("Retry-After", "2");
+        byte[] bytes = "{\"status\":503,\"error\":\"Service Unavailable\",\"message\":\"Rate limiting service is temporarily unavailable.\"}"
+                .getBytes(StandardCharsets.UTF_8);
+        DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(bytes);
+        return exchange.getResponse().writeWith(Mono.just(buffer));
     }
+
+    private record RateLimitResult(boolean allowed, int remainingTokens) { }
 }
