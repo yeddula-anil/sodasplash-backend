@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
@@ -85,6 +86,12 @@ public class RateLimiterFilter implements WebFilter, Ordered {
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
+        // A CORS preflight does not represent a protected API operation and
+        // must remain available even when the rate-limit backend is unhealthy.
+        if (HttpMethod.OPTIONS.equals(exchange.getRequest().getMethod())) {
+            return chain.filter(exchange);
+        }
+
         return userKeyResolver.resolve(exchange)
                 .defaultIfEmpty("ip:anonymous")
                 .flatMap(key -> consumeToken(key)
@@ -113,11 +120,23 @@ public class RateLimiterFilter implements WebFilter, Ordered {
                 )
                 .single()
                 .map(result -> {
-                    if (result.size() != 2 || !(result.get(0) instanceof Number) || !(result.get(1) instanceof Number)) {
+                    if (result.size() != 2) {
                         throw new IllegalStateException("Unexpected response from Upstash rate limiter");
                     }
-                    return new RateLimitResult(((Number) result.get(0)).intValue() == 1, ((Number) result.get(1)).intValue());
+                    return new RateLimitResult(asInteger(result.get(0)) == 1, asInteger(result.get(1)));
                 });
+    }
+
+    private int asInteger(Object value) {
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (NumberFormatException exception) {
+            throw new IllegalStateException("Unexpected response from Upstash rate limiter", exception);
+        }
     }
 
     private Mono<Void> rateLimitExceeded(ServerWebExchange exchange) {
